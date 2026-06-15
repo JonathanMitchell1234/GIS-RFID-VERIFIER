@@ -3,6 +3,8 @@ from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 import os
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 def strip_last_five(value: str) -> str:
@@ -15,8 +17,6 @@ def process_file(filepath: str) -> dict:
     Read the CSV file and compare toterfidserial (last 5 chars removed)
     to toteserial. Returns a dict with file-level results.
     """
-    filename = os.path.basename(filepath)
-
     df = pd.read_csv(filepath, dtype=str)
 
     # Check required columns exist
@@ -53,7 +53,7 @@ def process_file(filepath: str) -> dict:
 
     return {
         'filepath': filepath,
-        'filename': filename,
+        'filename': os.path.basename(filepath),
         'total': len(df),
         'matches': matches,
         'mismatches': mismatches,
@@ -68,6 +68,7 @@ class RFIDCheckerApp:
         self.root.resizable(False, False)
 
         self.file_list: list[str] = []
+        self._processing = False
 
         # --- File selection frame ---
         frame_file = ttk.LabelFrame(root, text="Step 1: Select CSV File(s)", padding=10)
@@ -80,6 +81,16 @@ class RFIDCheckerApp:
 
         lbl_count = ttk.Label(frame_file, textvariable=self.file_count_var)
         lbl_count.pack(side='left', padx=(15, 0))
+
+        # --- Progress bar ---
+        self.progress_var = tk.IntVar(value=0)
+        self.progress_bar = ttk.Progressbar(root, orient='horizontal', length=400,
+                                             mode='determinate', variable=self.progress_var)
+        self.progress_bar.pack(pady=(5, 0))
+
+        self.status_var = tk.StringVar(value="")
+        self.status_label = ttk.Label(root, textvariable=self.status_var, foreground='gray')
+        self.status_label.pack()
 
         # --- Run button ---
         self.run_btn = ttk.Button(root, text="Run Check on All Files", command=self.run_check, state='disabled')
@@ -129,6 +140,7 @@ class RFIDCheckerApp:
         self.file_list.clear()
         self.file_count_var.set("No files selected")
         self.run_btn.config(state='disabled')
+        self.status_var.set("")
 
     def _update_file_count(self):
         count = len(self.file_list)
@@ -145,51 +157,38 @@ class RFIDCheckerApp:
         self.result_text.see(tk.END)
         self.result_text.config(state='disabled')
 
-    def run_check(self):
-        if not self.file_list:
-            messagebox.showerror("Error", "Please add at least one CSV file.")
-            return
-
-        # Clear previous results
-        self.result_text.config(state='normal')
-        self.result_text.delete('1.0', tk.END)
-        self.result_text.config(state='disabled')
-
-        self.log(f"RFID Serial Checker - Bulk Run", 'header')
-        self.log(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 'info')
-        self.log(f"Files to check: {len(self.file_list)}", 'info')
-        self.log(f"{'='*80}", 'header')
-        self.log("", 'info')
-
+    def _process_results(self, results: list[dict]):
+        """Display all results (called on main thread after parallel processing completes)."""
+        total_files = len(results)
         all_files_ok = True
-        total_files = len(self.file_list)
         files_ok_count = 0
         files_fail_count = 0
         grand_total_rows = 0
         grand_total_matches = 0
         grand_total_mismatches = 0
 
-        for file_idx, filepath in enumerate(self.file_list, start=1):
-            filename = os.path.basename(filepath)
+        for file_idx, result in enumerate(results, start=1):
+            filename = result['filename']
             self.log(f"[{file_idx}/{total_files}] Checking: {filename}", 'header')
 
-            try:
-                result = process_file(filepath)
+            if 'error' in result:
+                files_fail_count += 1
+                all_files_ok = False
+                self.log(f"  ERROR: {result['error']}", 'error')
+            else:
                 grand_total_rows += result['total']
                 grand_total_matches += result['matches']
                 grand_total_mismatches += len(result['mismatches'])
 
                 if result['all_ok']:
                     files_ok_count += 1
-                    tag = 'filename_ok'
                     self.log(f"  ✓ ALL {result['total']} rows match.", 'success')
                 else:
                     files_fail_count += 1
                     all_files_ok = False
-                    tag = 'filename_bad'
                     self.log(f"  ✗ {len(result['mismatches'])} of {result['total']} rows MISMATCH.", 'error')
 
-                    for m in result['mismatches']:
+                    for m in result['mismatches'][:50]:  # Cap detail output at 50 rows per file
                         self.log(
                             f"    Row {m['row']}: "
                             f"toterfidserial='{m['toterfidserial_raw']}' "
@@ -197,12 +196,9 @@ class RFIDCheckerApp:
                             f"≠ toteserial='{m['toteserial']}'",
                             'error'
                         )
-
-            except Exception as e:
-                files_fail_count += 1
-                all_files_ok = False
-                tag = 'filename_bad'
-                self.log(f"  ERROR: {e}", 'error')
+                    remaining = len(result['mismatches']) - 50
+                    if remaining > 0:
+                        self.log(f"    ... and {remaining} more mismatches (see CSV file for full list)", 'warn')
 
             self.log("", 'info')
 
@@ -231,6 +227,78 @@ class RFIDCheckerApp:
                 f"Total mismatches: {grand_total_mismatches} row(s).\n"
                 f"See results window for details."
             )
+
+        # Re-enable controls
+        self._processing = False
+        self.run_btn.config(state='normal')
+        self.progress_var.set(100)
+        self.status_var.set(f"Done. {files_ok_count} OK, {files_fail_count} with issues.")
+
+    def _run_parallel(self):
+        """Run process_file in parallel using a thread pool (runs in background thread)."""
+        filepaths = list(self.file_list)
+        total = len(filepaths)
+        results = [None] * total
+
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8)) as executor:
+            future_map = {}
+            for i, fp in enumerate(filepaths):
+                future = executor.submit(process_file, fp)
+                future_map[future] = i
+
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    results[idx] = {
+                        'filepath': filepaths[idx],
+                        'filename': os.path.basename(filepaths[idx]),
+                        'error': str(e),
+                        'total': 0, 'matches': 0, 'mismatches': [], 'all_ok': False,
+                    }
+
+                # Update progress on main thread
+                completed = sum(1 for r in results if r is not None)
+                self.root.after(0, self._update_progress, completed, total, filepaths)
+
+        # All done — push results to main thread for display
+        self.root.after(0, self._process_results, results)
+
+    def _update_progress(self, completed: int, total: int, filepaths: list[str]):
+        pct = int((completed / total) * 100)
+        self.progress_var.set(pct)
+        current_file = filepaths[min(completed, total) - 1] if completed > 0 else ""
+        self.status_var.set(f"Processing {completed}/{total}: {os.path.basename(current_file)}")
+
+    def run_check(self):
+        if not self.file_list:
+            messagebox.showerror("Error", "Please add at least one CSV file.")
+            return
+        if self._processing:
+            return
+
+        self._processing = True
+        self.run_btn.config(state='disabled')
+
+        # Clear previous results
+        self.result_text.config(state='normal')
+        self.result_text.delete('1.0', tk.END)
+        self.result_text.config(state='disabled')
+
+        self.log(f"RFID Serial Checker - Bulk Run (Parallel)", 'header')
+        self.log(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 'info')
+        self.log(f"Files to check: {len(self.file_list)}", 'info')
+        self.log(f"Workers: {min(os.cpu_count() or 4, 8)} parallel threads", 'info')
+        self.log(f"{'='*80}", 'header')
+        self.log("", 'info')
+
+        self.progress_var.set(0)
+        self.status_var.set("Starting...")
+
+        # Run parallel processing in a background thread so UI stays responsive
+        thread = threading.Thread(target=self._run_parallel, daemon=True)
+        thread.start()
 
 
 def main():
